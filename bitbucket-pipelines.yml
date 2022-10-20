@@ -1,0 +1,309 @@
+image:
+  name: node:lts-alpine3.14
+definitions:
+  steps:
+    - step: &Dependency_Step
+        name: "Install dependencies"
+        trigger: automatic
+        caches:
+          - node
+        script:
+          - echo "$(date +"%D %T %Z") - Dependency installation starting"
+          - npm install -g npm@latest --no-save --no-package-lock
+          - npm install --legacy-peer-deps
+          - ## Add version to bottom of index.html ##
+            echo "<!-- ${PRODUCT_VERSION}.${BITBUCKET_BUILD_NUMBER}-${BITBUCKET_COMMIT::8} -->" >> src/index.html
+        artifacts:
+          - node_modules/**
+          - src/index.html
+          - /root/.npm/_logs/**
+
+    - step: &BuildWebApp
+        image: node:lts-alpine3.14
+        name: "Build WebApp"
+        trigger: automatic
+        services:
+            - docker
+        caches:
+            - docker
+        script:
+          - &Build_Script |
+            ## Build RealtyTrac UI ##
+            echo "$(date +"%D %T %Z") - Building RealtyTrac UI for ${BB_ENV} environment"
+            npm run build:shell:${BB_ENV}
+            echo "SSR Server"
+            npm run build:ssr${BB_ENV}
+            mv dist/server dist/${BB_ENV} && mv dist/browser dist/${BB_ENV} && cp -r deploy dist/${BB_ENV}
+
+            ## Remove Auth on Prod ##
+            if [[ $BB_ENV = "prd" ]]; then rm dist/${BB_ENV}/deploy/nginx_ui_auth.conf; fi
+
+            ## Create a temp folder for archives ##
+            mkdir -p dist/gz-archives/${BB_ENV}
+
+            ## Build Nginx Docker Image  ##
+            DOCKER_BUILD_VER=${PRODUCT_VERSION}.${BITBUCKET_BUILD_NUMBER}-${BITBUCKET_COMMIT::8}
+            echo "$(date +"%D %T %Z") - Building Nginx docker image version ${DOCKER_BUILD_VER}"
+            docker build -t rt-web -f deploy/ui.dockerfile --build-arg DOCKER_BUILD_VER=${DOCKER_BUILD_VER} --build-arg DOCKER_BUILD_ENV=${BB_ENV}  ./dist/${BB_ENV}
+            docker save rt-web | gzip > dist/${BB_ENV}/ui-dockerimage.gz
+            mv -f dist/${BB_ENV}/ui-dockerimage.gz dist/gz-archives/${BB_ENV}
+
+            ## Build SSR Docker Image  ##
+            echo "$(date +"%D %T %Z") - Building SSR docker image version ${DOCKER_BUILD_VER}"
+            docker build -t rt-web-ssr -f deploy/ui-ssr.dockerfile ./dist/${BB_ENV}
+            docker save rt-web-ssr | gzip > dist/${BB_ENV}/ui-ssr-dockerimage.gz
+            mv -f dist/${BB_ENV}/ui-ssr-dockerimage.gz dist/gz-archives/${BB_ENV}
+
+            ## Build SSR Prerender Docker Image  ##
+            echo "$(date +"%D %T %Z") - Building SSR Prerender docker image version ${DOCKER_BUILD_VER}"
+            docker build -t rt-web-ssr-render -f deploy/ui-ssr-prerender.dockerfile ./dist/${BB_ENV}
+            docker save rt-web-ssr-render | gzip > dist/${BB_ENV}/ui-ssr-render-dockerimage.gz
+            mv -f dist/${BB_ENV}/ui-ssr-render-dockerimage.gz dist/gz-archives/${BB_ENV}
+
+            ## Move files back to the dist ##
+            echo "Move files back to dist"
+            mv -f dist/gz-archives/${BB_ENV}/ui-dockerimage.gz dist/${BB_ENV}
+            mv -f dist/gz-archives/${BB_ENV}/ui-ssr-dockerimage.gz dist/${BB_ENV}
+            mv -f dist/gz-archives/${BB_ENV}/ui-ssr-render-dockerimage.gz dist/${BB_ENV}
+        artifacts:
+          - dist/*/ui-dockerimage.gz
+          - dist/*/ui-ssr-dockerimage.gz
+          - dist/*/ui-ssr-render-dockerimage.gz
+          - dist/*/**
+          - /root/.npm/_logs/**
+
+    - step: &DeployWebApp
+        name: "Deploy to Azure"
+        trigger: manual
+        services:
+          - docker
+        caches:
+          - docker
+        clone:
+          enabled: false
+        script:
+          - |
+            ## Deploy RealtyTrac UI ##
+            if [[ $BITBUCKET_DEPLOYMENT_ENVIRONMENT = "prod" ]]; then export BITBUCKET_DEPLOYMENT_ENVIRONMENT="prd"; fi
+            echo "$(date +"%D %T %Z") - Deploying RealtyTrac UI to ${BITBUCKET_DEPLOYMENT_ENVIRONMENT} environment"
+            export IMAGE_NAME=${CONTAINER_REGISTRY}/realtytrac-web-${BITBUCKET_DEPLOYMENT_ENVIRONMENT}
+            echo "$(date +"%D %T %Z") - Pushing ${IMAGE_NAME}"
+          - docker load < dist/${BITBUCKET_DEPLOYMENT_ENVIRONMENT}/ui-dockerimage.gz
+          - docker tag rt-web ${IMAGE_NAME}:${BITBUCKET_BUILD_NUMBER} && docker tag rt-web ${IMAGE_NAME}:latest
+          - docker login -u $DOCKER_HUB_USER -p $DOCKER_HUB_PASSWORD $CONTAINER_REGISTRY
+          - docker push ${IMAGE_NAME}
+          - |
+            ## Deploy RealtyTrac UI SSR ##
+            echo "$(date +"%D %T %Z") - Deploying RealtyTrac SSR UI to ${BITBUCKET_DEPLOYMENT_ENVIRONMENT} environment"
+            export IMAGE_NAME=${CONTAINER_REGISTRY}/realtytrac-web-${BITBUCKET_DEPLOYMENT_ENVIRONMENT}-ssr
+            echo "$(date +"%D %T %Z") - Pushing ${IMAGE_NAME}"
+          - docker load < dist/${BITBUCKET_DEPLOYMENT_ENVIRONMENT}/ui-ssr-dockerimage.gz
+          - docker tag rt-web-ssr ${IMAGE_NAME}:${BITBUCKET_BUILD_NUMBER} && docker tag rt-web-ssr ${IMAGE_NAME}:latest
+          - docker push ${IMAGE_NAME}
+          - |
+            ## Deploy RealtyTrac UI SSR Prerender ##
+            echo "$(date +"%D %T %Z") - Deploying RealtyTrac SSR UI Prerender to ${BITBUCKET_DEPLOYMENT_ENVIRONMENT} environment"
+            export IMAGE_NAME=${CONTAINER_REGISTRY}/realtytrac-web-${BITBUCKET_DEPLOYMENT_ENVIRONMENT}-ssr-render
+            echo "$(date +"%D %T %Z") - Pushing ${IMAGE_NAME}"
+          - docker load < dist/${BITBUCKET_DEPLOYMENT_ENVIRONMENT}/ui-ssr-render-dockerimage.gz
+          - docker tag rt-web-ssr-render ${IMAGE_NAME}:${BITBUCKET_BUILD_NUMBER} && docker tag rt-web-ssr-render ${IMAGE_NAME}:latest            
+          - docker push ${IMAGE_NAME}
+    - step: &SwapSlotUat
+        name: "Swap Azure UAT Slot"
+        script:
+          - echo "$(date)"
+          - pipe: microsoft/azure-cli-run:1.1.0
+            variables:
+              AZURE_APP_ID: $ARM_CLIENT_ID
+              AZURE_PASSWORD: $ARM_CLIENT_SECRET
+              AZURE_TENANT_ID: $ARM_TENANT_ID
+              CLI_COMMAND: 'az webapp deployment slot swap --name rtweb-uat --resource-group realtytrac-uat --slot deploy --subscription e62fd744-9d9f-47a0-afe9-fec6bdb51928'
+    - step: &SwapSlotUatSsr
+        name: "Swap Azure UAT-SSR Slot"
+        script:
+          - echo "$(date)"
+          - pipe: microsoft/azure-cli-run:1.1.0
+            variables:
+              AZURE_APP_ID: $ARM_CLIENT_ID
+              AZURE_PASSWORD: $ARM_CLIENT_SECRET
+              AZURE_TENANT_ID: $ARM_TENANT_ID
+              CLI_COMMAND: 'az webapp deployment slot swap --name rtweb-uat-ssr --resource-group realtytrac-uat --slot deploy --subscription e62fd744-9d9f-47a0-afe9-fec6bdb51928'
+    - step: &SwapSlotPrd
+        name: "Swap Azure PROD Slot"
+        script:
+          - echo "$(date)"
+          - pipe: microsoft/azure-cli-run:1.1.0
+            variables:
+              AZURE_APP_ID: $ARM_CLIENT_ID
+              AZURE_PASSWORD: $ARM_CLIENT_SECRET
+              AZURE_TENANT_ID: $ARM_TENANT_ID
+              CLI_COMMAND: 'az webapp deployment slot swap --name rtweb-prd --resource-group realtytrac-prd --slot deploy --subscription d0fd497d-3666-4152-978c-b5dfcd8fafa5'
+    - step: &SwapSlotPrdSsr
+        name: "Swap Azure PROD-SSR Slot"
+        script:
+          - echo "$(date)"
+          - pipe: microsoft/azure-cli-run:1.1.0
+            variables:
+              AZURE_APP_ID: $ARM_CLIENT_ID
+              AZURE_PASSWORD: $ARM_CLIENT_SECRET
+              AZURE_TENANT_ID: $ARM_TENANT_ID
+              CLI_COMMAND: 'az webapp deployment slot swap --name rtweb-prd-ssr --resource-group realtytrac-prd --slot deploy --subscription d0fd497d-3666-4152-978c-b5dfcd8fafa5'
+        after-script:
+          - |
+            ############ Determine if deployment was successful or not ##################
+            echo "$(date)"
+            EMAIL_RESULT="FAILED"
+            if [[ $BITBUCKET_EXIT_CODE -eq 0 ]]; then EMAIL_RESULT="SUCCESS"; fi
+            echo "${EMAIL_RESULT}"
+          - pipe: atlassian/email-notify:0.4.3
+            variables:
+              USERNAME: ${EMAIL_USER}
+              PASSWORD: ${EMAIL_PASSWORD}
+              FROM: ${EMAIL_FROM}
+              TO: ${EMAIL_TO}
+              HOST: ${EMAIL_SMTP_HOST}
+              SUBJECT: "FrontEnd - Production Deployment ${BITBUCKET_BUILD_NUMBER} finished. ${EMAIL_RESULT}"
+              BODY_PLAIN: "FrontEnd - Production Deployment of <a href='https://bitbucket.org/${BITBUCKET_WORKSPACE}/${BITBUCKET_REPO_SLUG}/addon/pipelines/home#!/results/${BITBUCKET_BUILD_NUMBER}'> build ${BITBUCKET_BUILD_NUMBER}</a> has finished. The result was ${EMAIL_RESULT}."
+    - step: &TagRelease
+        name: "Tag with Release"
+        image:
+          name: realtytraccontainerregistry.azurecr.io/realtytrac-build-image:latest
+          username: $DOCKER_HUB_USER
+          password: $DOCKER_HUB_PASSWORD
+        script:
+          - |
+            echo "Tagging release branch with release number"
+            echo "Remeber to merge with master and dev"
+          - |
+            git tag -am "Tag for ${BITBUCKET_BUILD_NUMBER}" release-${BITBUCKET_BUILD_NUMBER}
+            git push origin --tags
+
+pipelines:
+  branches:
+    dev:
+      - step: *Dependency_Step
+      - parallel:
+        # DEV BUILD
+        - step:
+            <<: *BuildWebApp
+            size: 2x
+            name: "Build DEV WebApp"
+            trigger: automatic
+            script:
+              - BB_ENV=dev
+              - *Build_Script
+        # QA BUILD
+        - step:
+            <<: *BuildWebApp
+            size: 2x
+            name: "Build QA WebApp"
+            trigger: automatic
+            script:
+              - BB_ENV=qa
+              - *Build_Script
+      #DEV DEPLOY
+      - step:
+          <<: *DeployWebApp
+          name: "Deploy DEV to Azure"
+          trigger: automatic
+          deployment: dev
+      #QA DEPLOY
+      - step:
+          <<: *DeployWebApp
+          name: "Deploy QA to Azure"
+          deployment: qa
+
+    release/*:
+      - step: *Dependency_Step
+      - parallel:
+          # UAT BUILD
+          - step:
+              <<: *BuildWebApp
+              size: 2x
+              name: "Build UAT WebApp"
+              script:
+                - BB_ENV=uat
+                - echo "The step following this will deploy the application to the passive Deployment Slot. It will not be live until it is Swapped, which is the step after (Automatic in UAT)"
+                - echo "The slot can be accessed at https://rtweb-uat-deploy.azurewebsites.net"
+                - *Build_Script
+          # PRD BUILD
+          - step:
+              <<: *BuildWebApp
+              size: 2x
+              name: "Build PRD WebApp"
+              script:
+                - BB_ENV=prd
+                - echo "The step following this will deploy the application to the passive Deployment Slot. It will not be live until it is Swapped, which is the step after (Automatic in UAT)"
+                - echo "The slot can be accessed at https://rtweb-prd-deploy.azurewebsites.net"
+                - *Build_Script
+        #UAT DEPLOY
+      - step:
+          <<: *DeployWebApp
+          name: "Deploy UAT to Azure"
+          deployment: uat
+      - parallel:
+        - step: *SwapSlotUat
+        - step: *SwapSlotUatSsr
+        #PRD DEPLOY
+      - step:
+          name: "Start Deployment of PROD to Azure"
+          trigger: manual
+          script:
+          - echo "$(date) This will start the deployment by emailing a notification and then automatically proceeding"
+          - pipe: atlassian/email-notify:0.4.3
+            variables:
+              USERNAME: ${EMAIL_USER}
+              PASSWORD: ${EMAIL_PASSWORD}
+              FROM: ${EMAIL_FROM}
+              TO: ${EMAIL_TO}
+              HOST: ${EMAIL_SMTP_HOST}
+              SUBJECT: "FrontEnd - Production Deployment ${BITBUCKET_BUILD_NUMBER} started."
+              BODY_PLAIN: "FrontEnd - Production Deployment of <a href='https://bitbucket.org/${BITBUCKET_WORKSPACE}/${BITBUCKET_REPO_SLUG}/addon/pipelines/home#!/results/${BITBUCKET_BUILD_NUMBER}'> build ${BITBUCKET_BUILD_NUMBER}</a> has started."
+      - step:
+          <<: *DeployWebApp
+          name: "Deploy PRD to Azure"
+          trigger: automatic
+          deployment: prod
+      - parallel:
+        - step: *SwapSlotPrd
+        - step: *SwapSlotPrdSsr
+      - step: *TagRelease
+
+    hot-fix/*:
+      - step: *Dependency_Step
+      - parallel:
+          # UAT Hotfix BUILD
+          - step:
+              <<: *BuildWebApp
+              name: "Build UAT Hotfix WebApp"
+              script:
+                - BB_ENV=uat
+                - echo "The step following this will deploy the application to the passive Deployment Slot. It will not be live until it is Swapped, which is the step after (Automatic in UAT)"
+                - echo "The slot can be accessed at https://rtweb-uat-deploy.azurewebsites.net"
+                - *Build_Script
+          # PRD Hotfix BUILD
+          - step:
+              <<: *BuildWebApp
+              name: "Build PRD Hotfix WebApp"
+              script:
+                - BB_ENV=prd
+                - echo "The step following this will deploy the application to the passive Deployment Slot. It will not be live until it is Swapped, which is the step after (Automatic in UAT)"
+                - echo "The slot can be accessed at https://rtweb-prd-deploy.azurewebsites.net"
+                - *Build_Script
+        #UAT Hotfix DEPLOY
+      - step:
+          <<: *DeployWebApp
+          name: "Deploy UAT Hotfix to Azure"
+          deployment: uat
+      - parallel:
+        - step: *SwapSlotUat
+        - step: *SwapSlotUatSsr
+        #PRD Hotfix DEPLOY
+      - step:
+          <<: *DeployWebApp
+          name: "Deploy PRD Hotfix to Azure"
+          deployment: prod
+      - parallel:
+        - step: *SwapSlotPrd
+        - step: *SwapSlotPrdSsr
+      - step: *TagRelease

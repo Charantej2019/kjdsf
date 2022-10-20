@@ -1,0 +1,46 @@
+{
+  "compileOnSave": false,
+  "compilerOptions": {
+    "allowUnreachableCode": false,
+    "allowUnusedLabels": false,
+    "baseUrl": ".",
+    "declaration": false,
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "lib": ["es2017", "dom"],
+    "moduleResolution": "node",
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "outDir": "./dist/out-tsc",
+    "paths": {
+      "$billing": ["./src/app/shared/stores/billing"],
+      "$coupons": ["./src/app/shared/stores/coupons"],
+      "$domain": ["./src/app/shared/stores/domain"],
+      "$enums": ["./src/shared/models/enums.ts"],
+      "$env": ["./src/environments/environment.ts"],
+      "$modals": ["./src/app/components/project/modals"],
+      "$settings": ["./src/app/shared/stores/settings"],
+      "$site": ["./src/app/site.module"],
+      "$subscriptionPlan": ["./src/app/shared/stores/subscription-plan"],
+      "$ui": ["./src/app/shared/stores/ui"],
+      "$user": ["./src/app/shared/stores/user"],
+      "$userSubscription": ["./src/app/shared/stores/user-subscription"],
+      "$utils": ["./src/app/shared/utils"]
+    },
+    "skipLibCheck": true,
+    "sourceMap": true,
+    "strict": true,
+    "strictNullChecks": true,
+    "allowSyntheticDefaultImports": true,
+    "noImplicitAny": true,
+    "target": "es5",
+    "module": "es2020",
+    "typeRoots": ["node_modules/@types"]
+  },
+  "angularCompilerOptions": {
+    "fullTemplateTypeCheck": false,
+    "preserveWhitespaces": false
+  },
+  "include": ["src/**/*"],
+  "exclude": ["e2e", "**/*.spec.ts", "node_modules"]
+}
